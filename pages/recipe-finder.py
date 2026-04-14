@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
+import requests
 
 # Page config 
 st.set_page_config(page_title="Recipe Finder | Hoos Hungry?", layout="centered", initial_sidebar_state="collapsed")
@@ -68,6 +69,62 @@ div[data-testid="stButton"] > button:hover { background: #4a7a50 !important; }
 </style>
 """, unsafe_allow_html=True)
 
+SPOONACULAR_SITE = "https://api.spoonacular.com"
+
+def get_api_key():
+    try:
+        return st.secrets["SPOONACULAR_KEY"]
+    except (KeyError, FileNotFoundError):
+        return None
+
+@st.cache_data(ttl=3600)
+def search_recipes(query, meal_type, max_ready_time, number=9):
+    api_key = get_api_key()
+    if not api_key:
+        return None, "no_key"
+    
+    params = {
+        "apiKey" : api_key,
+        "query" : query,
+        "number": number,
+        "addRecipeInformation": True,
+        "fillIngredients" : False,
+    }
+    if meal_type != "All":
+        params["type"] = meal_type.lower()
+    if max_ready_time < 120:
+        params['maxReadyTime'] = max_ready_time
+
+    try:
+        response = requests.get(f"{SPOONACULAR_SITE}/recipes/complexSearch",
+                                params=params, timeout=10)
+        if response.status_code == 401:
+            return None, "unauthorized"
+        elif response.status_code == 404:
+            return None, "not_found"
+        elif response.status_code == 429:
+            return None, "rate_limit"
+        elif response.status_code >= 500:
+            return None, "server_error"
+        elif response.status_code != 200:
+            return None, f"unexpected_error_{response.status_code}"
+        
+        data = response.json()
+        results = data.get("results", [])
+
+        if len(results) == 0:
+            return None, "empty"  
+        return results, "ok"
+    
+    except requests.exceptions.Timeout:
+        return None, "timeout"
+    except requests.exceptions.ConnectionError:
+        return None, "connection_error"
+    except requests.exceptions.RequestException as e:
+        return None, f"request_error: {e}"
+    except ValueError:
+        return None, "parse_error"
+
 # Cached recipe data 
 @st.cache_data
 def load_recipe_data():
@@ -121,6 +178,44 @@ search_query = st.text_input(
     label_visibility="collapsed"
 )
 
+api_results = None
+api_status = None
+
+if search_query:
+    api_results, api_status = search_recipes(
+        search_query,
+        st.session_state.recipe_filter,
+        120
+    )
+
+    if api_status == "ok":
+        st.write(f"✅ API call worked. Found {len(api_results)} recipe(s) from Spoonacular.")
+    elif api_status == "no_key":
+        st.error("No API key found in Streamlit secrets.")
+    elif api_status == "unauthorized":
+        st.error("Unauthorized: your Spoonacular API key may be invalid.")
+    elif api_status == "rate_limit":
+        st.error("Rate limit reached for the Spoonacular API.")
+    elif api_status == "not_found":
+        st.warning("No matching recipes found from the API.")
+    else:
+        st.error(f"API call failed: {api_status}")
+
+# Layout primitive: st.columns for category filter buttons + sort
+col1, col2, col3, col4, col5 = st.columns(5)
+for col, label in zip([col1, col2, col3, col4], ["All", "Breakfast", "Lunch", "Dinner"]):
+    with col:
+        if st.button(label, key=f"cat_{label}"):
+            st.session_state.recipe_filter = label
+            st.rerun()
+
+with col5:
+    # Widget 2: sort selectbox
+    sort_by = st.selectbox("Sort", ["Rating ↓", "Calories ↑", "Prep Time ↑"],
+                           key="sort_sel", label_visibility="collapsed")
+
+st.caption(f"Active filter: **{st.session_state.recipe_filter}**")
+
 # Layout primitive: st.columns for category filter buttons + sort
 col1, col2, col3, col4, col5 = st.columns(5)
 for col, label in zip([col1, col2, col3, col4], ["All", "Breakfast", "Lunch", "Dinner"]):
@@ -160,9 +255,17 @@ sort_map = {
 sort_col, sort_asc = sort_map[sort_by]
 filtered = filtered.sort_values(sort_col, ascending=sort_asc)
 
+# Show API results when available
+if search_query and api_status == "ok" and api_results:
+    st.subheader("🍽️ Spoonacular Results")
+    for recipe in api_results:
+        st.write(f"**{recipe['title']}**")
+        if recipe.get("image"):
+            st.image(recipe["image"], width=200)
+
 # Feedback messages 
 if search_query:
-    st.info(f"🔍 Results for **\"{search_query}\"** — {len(filtered)} recipe(s) found.")
+    st.info(f"🔍 Results for **\"{search_query}\"** — {len(filtered)} recipe(s) from local database found.")
 elif st.session_state.recipe_filter != "All":
     st.info(f"📂 Showing **{st.session_state.recipe_filter}** — {len(filtered)} recipes.")
 else:
